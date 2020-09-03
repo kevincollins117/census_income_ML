@@ -1,0 +1,691 @@
+---
+title: "Final Project"
+author: "Kevin Collins"
+date: "4/27/2020"
+output: html_document
+---
+
+### Foreword 
+The goal of this project is to attempt to predict federal income tax bracket for college degree holders in New York City as a function of field of degree, race, sex, and age. 
+
+We will be using IPUMS microdata from the 2018 5-Year ACS to construct various statistical learning models in order to hopefully uncover how best to answer this question.
+
+There were many iterations of this project, wherein I struggled to deal with data size and dimensions. These are not the most efficient models, but I think we will see that it is quite a difficult problem. Obviously, having more predictor variables is always an asset, but the progress we make through these models is enlightening to the kinds of techniques that might better work for a question of this sort without using intensive computing resources.
+
+```{r, include=FALSE}
+library(tidyverse)
+library(data.table)
+library(rpart)
+library(caret)
+library(doParallel)
+library(fastDummies)
+library(randomForest)
+library(class)
+library(psych)
+library(e1071)
+library(gbm)
+```
+
+### Data Cleaning
+```{r, eval = FALSE}
+ipums.data <- fread("usa_00002.csv")
+deg.labels <- fread("deg_label.csv")[,c(1,2)]
+colnames(deg.labels) <- c("DEGFIELD", "deg.field")
+deg.labels$DEGFIELD <- as.factor(deg.labels$DEGFIELD)
+race.labels <- fread("race_label.csv")[,c(1,2)]
+colnames(race.labels) <- c("RACE", "race")
+race.labels$RACE <- as.factor(race.labels$RACE)
+```
+
+The following cleaning steps were taken:
+
+  -Filtering for only New York, NY.
+
+  -Filtering out those who do not hold college degrees.
+
+  -Converting numeric codes to actual labels for race and field of degree variables.
+  
+  -Adding a variable 'federal.tax' that describes the 2019 federal tax bracket based on income.
+```{r, eval = FALSE}
+ipums <- ipums.data  %>% filter(CITY == 4610)
+
+ipums$DEGFIELD <- as.factor(ipums$DEGFIELD)
+ipums$RACE <- as.factor(ipums$RACE)
+
+ipums <- ipums %>%
+  left_join(deg.labels,
+            by = "DEGFIELD") %>%
+  left_join(race.labels,
+            by = "RACE")
+
+ipums <- ipums %>%
+  filter(DEGFIELD != 0) %>%
+  select(SEX, AGE, race, deg.field, INCTOT)
+
+ipums$deg.field <- as.factor(ipums$deg.field)
+
+ipums <- data.frame(ipums)
+
+#2019 federal tax rates
+ipums <- ipums%>%
+  mutate(federal.tax = cut(ipums$INCTOT, breaks = c(min(ipums$INCTOT)-1, 9700, 39475, 84200, 160725, 204100, 510300, max(ipums$INCTOT)+1)))
+
+levels(ipums$federal.tax) <- c("10%", "12%", "22%", "24%", "32%", "35%", "37%")
+```
+
+As previously referenced, the dimensions of this problem became quite difficult, so I attempted to combine some levels within the field of degree and race variables that I felt were similar enough to be justified.
+
+```{r, eval = FALSE}
+degrees <- c("Professional Degree", "Other", "Social Sciences", "Physical Sciences",  "Business",
+             "Communications", "Communications", "Computer Sciences", "Other",
+             "Other", "Other", "Professional Degree", "Tech",  "Engineering", "Engineering",  "Humanities", "Physical Sciences", "Other", "Fine Arts", "Other", "Humanities", "Professional Degree", "Humanities", "Other", "Humanities", "Linguistics and Foreign Languages", "Mathematics and Statistics", "Medical and Health Sciences and Services",  "Tech", "Tech",  "Humanities",  "Other",  "Physical Sciences", "Social Sciences", "Other", "Social Sciences",  "Humanities", "Tech")
+
+levels(ipums$deg.field) <- degrees
+
+ipums$race <-  factor(ipums$race)
+levels(ipums$race)[c(6,7,8)] <- "Other race"
+```
+
+We will create a 70/30 test-training split.
+
+```{r, eval=FALSE}
+indexes <- sample(nrow(ipums),
+                  size = .7*nrow(ipums),
+                  replace = FALSE)
+ipums.train <- ipums[indexes,]
+ipums.test <- ipums[-indexes,]
+
+write.csv(ipums.train,
+          "ipums.train.csv")
+write.csv(ipums.test,
+          "ipums.test.csv")
+```
+
+Reading in our already cleaned and separated data to expedite the process of knitting the findal html file.
+```{r}
+ipums.train <- fread("ipums.train.csv")
+ipums.test <- fread("ipums.test.csv")
+ipums <- rbind(ipums.test, ipums.train)
+```
+
+### EDA
+
+First, let's take a look at the income distribution of our population subset.
+
+```{r}
+ipums %>%
+  ggplot(aes(x = INCTOT)) +
+  geom_density(fill = "goldenrod",
+               alpha = 0.2) +
+  theme_classic()
+
+summary(ipums$INCTOT)
+```
+
+There is a massive right-skew going on here, which may prove difficult for prediction. Let's take a look at the actual breakout of federal tax brackets.
+
+```{r}
+ipums %>%
+  ggplot(aes(x = federal.tax)) +
+  geom_bar(aes(fill = federal.tax)) +
+  theme_classic() +
+  xlab("Federal Income Tax") +
+  ylab("Count") +
+  scale_fill_viridis_d(option = "C")
+```
+
+Similarly to the previous graph, we see a right-skewed distribution. The 22% bracket is the most populous, while  32%, 35%, and 37% are drastically less populated than the lower four. This will prove difficult to classify, given their underrepresentation, but hopefully there are some measures that can be taken.
+
+Moving onto breakouts of each of our variables:
+
+```{r}
+ipums %>%
+  ggplot(aes(x = deg.field)) +
+  geom_bar(aes(fill  = federal.tax),
+           position = "fill") +
+  coord_flip() +
+  theme_classic() +
+  scale_fill_viridis_d(option = "C") +
+  xlab('Degree Field') +
+  ylab('Proportion')
+```
+
+There are fairly expected variations here- notably, medical services, engineering, and computer sciences seem to end up in higher tax brackets. Something that I found surprising is the distribution for Linguistics and Foreign Languages. Perhaps there is a lot of money to be made for a translator.
+
+```{r}
+ipums %>%
+  ggplot(aes(x = race)) +
+  geom_bar(aes(fill  = federal.tax),
+           position = "fill") +
+  coord_flip() +
+  theme_classic() +
+  scale_fill_viridis_d(option = "C") +
+  xlab('Race') +
+  ylab('Proportion')
+```
+
+There are essentially three distribution tiers going on here: We see white people are typically populating the higher tax brackets, followed by Asian populations, and then black people, indigenous people, and those of mixed races are typically lower/middle income.
+
+```{r}
+ipums %>%
+  ggplot(aes(x = factor(SEX))) +
+  geom_bar(aes(fill  = federal.tax),
+           position = "fill") +
+  coord_flip() +
+  theme_classic() +
+  scale_fill_viridis_d(option = "C") +
+  xlab('Sex') +
+  ylab('Proportion') +
+  scale_x_discrete(labels = c('Male', 'Female'))
+```
+
+A higher proportion of men inhabit the upper tax brackets than women.
+
+```{r}
+ipums %>%
+  ggplot(aes(x = AGE)) +
+  geom_bar(aes(fill  = federal.tax),
+           position = "fill") +
+  coord_flip() +
+  theme_classic() +
+  scale_fill_viridis_d(option = "C") +
+  xlab('Age') +
+  ylab('Proportion')
+```
+
+The age breakout is particularly interesting. Naturally, people make more money as they get older, but they seem to peak around age 50. What accounts for this decrease? Instinct says that the wealthy begin to retire and then therefore have less annual income. Notably, the proportion of the population in the bottom bracket becomes fairly steady after about age 25, which implies little mobility in or out of that bracket.
+
+What do all of these variables have in common?
+
+### Unsupervised Learning
+
+We will utilize k-means clustering to see if we can emulate the categorization of tax brackets by using only race, sex, age, and field of degree.
+
+First, however, we need to create dummy variables for each of our factor-based variables.
+```{r}
+ipums.train_dummy <- dummy_cols(ipums.train, select_columns = c("race", "deg.field")) %>%
+  select(-INCTOT, -race, -deg.field, -federal.tax, -SEX, -V1)
+ipums.test_dummy <- dummy_cols(ipums.test, select_columns = c("race", "deg.field")) %>%
+  select(-INCTOT, -race, -deg.field, -federal.tax, -SEX, -V1)
+
+ipums_dummy <- rbind(ipums.test_dummy,
+                     ipums.train_dummy)
+
+km <- kmeans(ipums_dummy,
+             7)
+
+clusters <- factor(km$cluster)
+
+cluster.data <- data.frame(clusters,
+           federal.tax = ipums$federal.tax)
+
+cluster.data %>%
+  ggplot(aes(x = federal.tax)) +
+  geom_bar(aes(fill = federal.tax)) +
+  facet_wrap(~clusters)
+```
+
+Okay, so we did not get the lovely separation we might have liked for tax brackets. But something interesting has still occurred here. Each of these clusters does seem to have a somewhat unique tax bracket distribution. For example, cluster 7 has high levels of the higher-income tax brackets, while cluster 1 has virtually none. This is an insight into why this problem may prove difficult to classify. It's not necessarily that certain types of people are going to be in certain brackets, but rather that certain types of people are going to have different likelihoods of falling into different brackets.
+
+Let's move into the modeling portion of this exercise.
+
+### Metrics of Evalution
+
+First, we need to define how we will compare our models against on another. In order to be somewhat exhaustive, we will consider the three following metrics.
+
+##### Accuracy
+
+Perhaps the most basic metric, how accurate is the model? How many observations does it correctly classify? This is important to consider because at the end of the day we want our model to do its job correctly. However, since we are dealing with a multiclass problem, this doesn't necessarily paint the whole picture.
+
+##### Cohen's Kappa
+
+Using Kappa, we will be able to tell whether we are performing better than simple random guessing. At the very least, we hope to be able to construct a model that is more powerful than a random guess. This is also necessary to contrast with accuracy. Since we have such unbalanced classes, it might yield decent accuracy to simply throw a bunch of guesses into the most populous brackets, but that's still somewhat random guessing. Can we do better than that?
+
+##### Precision/Recall
+
+Finally, we will also use precision and recall to judge class-specific performance. I foresee that the higher tax brackets will be harder to predict, so precision and recall will help us understand how different models perform with respect to each individual class.
+
+We will look at each of these three metrics to compare the following models. In order to do so, I've written a function that will output all three and a confusion matrix given a prediction vector and an answer vector.
+
+```{r}
+performance <- function(predicted, actual){
+  confusion <- table(predicted, actual)
+  print(confusion)
+  
+  performance <- data.frame(Accuracy = sum(diag(confusion))/sum(confusion),
+                            Cohen.Kappa = cohen.kappa(confusion)$kappa)
+  
+  print(performance)
+  
+  precision.recall <- data.frame(recall = diag(confusion)/apply(confusion, 1, sum),
+                                 precision = diag(confusion)/apply(confusion, 2, sum))
+  print(precision.recall)
+  
+  performance.metrics <- list(confusion, performance, precision.recall)
+}
+```
+
+### Supervised Learning
+
+
+##### Linear Regression
+
+First, we construct a simple linear model.
+
+Now linear regression does not lend itself to classification, so we will do a point-estimate preidction on the INCTOT variable, and then classify the tax bracket based on that.
+```{r, eval = FALSE}
+linear.model  <- lm(INCTOT ~ AGE + SEX + race + deg.field,
+                    data = ipums.train)
+
+save(linear.model,
+     file = 'linear.model.R')
+```
+
+```{r}
+load('linear.model.R')
+
+lm.predict <- data.frame(prediction  = predict(linear.model,
+                                               ipums.test))
+
+lm.predict <- lm.predict %>%
+  mutate(predicted.bracket = cut(lm.predict$prediction, breaks = c(min(ipums$INCTOT)-1, 9700, 39475, 84200, 160725, 204100, 510300, max(ipums$INCTOT)+1)))
+
+levels(lm.predict$predicted.bracket) <- c("10%", "12%", "22%", "24%", "32%", "35%", "37%")
+
+performance(lm.predict$predicted.bracket, ipums.test$federal.tax)
+```
+
+This model is not a great start. We achieve an accuracy of under 30% with a Kappa of .042, which implies that our linear model is barely doing better than random guessing. This should be fairly expected given the distribution of income, our model is highly unlikely to predict anyone has a high enough income to get in the three uppermost brackets. What's interesting, is the same is reflected for the 10% bracket. Our model focuses all predictions on the three most populous income brackets. Precision/Recall are also not great for any of the categories. 
+
+Hopefully we can do better moving forward!
+
+##### One vs. Rest - Logistic Regression
+
+For our next model, we'll try logistic regression. My logic for this approach is that in the past it has been useful for binary classification. However, I wish to extend this to multi-classification. Therefore, I will take a one vs. rest approach, wherein I will construct 7 different models, each of which will calculate the probability of being in each tax bracket vs not. Then, the highest probability will be the ensemble's vote.
+
+```{r logistic regression models, eval = FALSE}
+logit.data <- dummy_cols(ipums.train, select_columns = "federal.tax")
+
+logit.1 <- glm(`federal.tax_10%` ~ AGE + SEX + race + deg.field,
+    data = logit.data,
+    family = "binomial")
+save(logit.1,
+     file = "logit.1.R")
+
+logit.2 <- glm(`federal.tax_12%` ~ AGE + SEX + race + deg.field,
+    data = logit.data,
+    family = "binomial")
+save(logit.2,
+     file = "logit.2.R")
+
+logit.3 <- glm(`federal.tax_22%` ~ AGE + SEX + race + deg.field,
+    data = logit.data,
+    family = "binomial")
+save(logit.3,
+     file = "logit.3.R")
+
+logit.4 <- glm(`federal.tax_24%` ~ AGE + SEX + race + deg.field,
+    data = logit.data,
+    family = "binomial")
+save(logit.4,
+     file = "logit.4.R")
+
+logit.5 <- glm(`federal.tax_32%` ~ AGE + SEX + race + deg.field,
+    data = logit.data,
+    family = "binomial")
+save(logit.5,
+     file = "logit.5.R")
+
+logit.6 <- glm(`federal.tax_35%` ~ AGE + SEX + race + deg.field,
+    data = logit.data,
+    family = "binomial")
+save(logit.6,
+     file = "logit.6.R")
+
+logit.7 <-glm(`federal.tax_37%` ~ AGE + SEX + race + deg.field,
+    data = logit.data,
+    family = "binomial")
+save(logit.7,
+     file = "logit.7.R")
+
+```
+
+```{r load logistic regression models}
+load("logit.1.R")
+load("logit.2.R")
+load("logit.3.R")
+load("logit.4.R")
+load("logit.5.R")
+load("logit.6.R")
+load("logit.7.R")
+```
+
+```{r test logistic regression models}
+logit.prediction <- data.frame()
+
+logit.prediction <- rbind(logit.prediction,
+                          data.frame(obs = c(1:nrow(ipums.test)),
+                                     prob = predict.glm(logit.1,
+                                                        ipums.test,
+                                                        type = "response"),
+                                     federal.tax = rep("10%", nrow(ipums.test))))
+logit.prediction <- rbind(logit.prediction,
+                          data.frame(obs = c(1:nrow(ipums.test)),
+                                     prob = predict.glm(logit.2,
+                                                        ipums.test,
+                                                        type = "response"),
+                                     federal.tax = rep("12%", nrow(ipums.test))))
+logit.prediction <- rbind(logit.prediction,
+                          data.frame(obs = c(1:nrow(ipums.test)),
+                                     prob = predict.glm(logit.3,
+                                                        ipums.test,
+                                                        type = "response"),
+                                     federal.tax = rep("22%", nrow(ipums.test))))
+logit.prediction <- rbind(logit.prediction,
+                          data.frame(obs = c(1:nrow(ipums.test)),
+                                     prob = predict.glm(logit.4,
+                                                        ipums.test,
+                                                        type = "response"),
+                                     federal.tax = rep("24%", nrow(ipums.test))))
+logit.prediction <- rbind(logit.prediction,
+                          data.frame(obs = c(1:nrow(ipums.test)),
+                                     prob = predict.glm(logit.5,
+                                                        ipums.test,
+                                                        type = "response"),
+                                     federal.tax = rep("32%", nrow(ipums.test))))
+logit.prediction <- rbind(logit.prediction,
+                          data.frame(obs = c(1:nrow(ipums.test)),
+                                     prob = predict.glm(logit.6,
+                                                        ipums.test,
+                                                        type = "response"),
+                                     federal.tax = rep("35%", nrow(ipums.test))))
+logit.prediction <- rbind(logit.prediction,
+                          data.frame(obs = c(1:nrow(ipums.test)),
+                                     prob = predict.glm(logit.7,
+                                                        ipums.test,
+                                                        type = "response"),
+                                     federal.tax = rep("37%", nrow(ipums.test))))
+
+logit.prediction <- logit.prediction %>%
+  group_by(obs) %>%
+  filter(prob == max(prob))
+
+logit.prediction <- distinct(logit.prediction, obs, .keep_all = TRUE)
+
+
+performance(logit.prediction$federal.tax, ipums.test$federal.tax)
+```
+
+Logistic regression has succeeded in one area that linear regression failed- it predicted 9 correct cases in the 10% tax bracket, as opposed to 0. Beyond that, the results are bleak. We somehow achieve a slightly beter accuracy than linear regression, but our Kappa is reduced to .003. One interesting result from this is that the precision for the 22% tax bracket is actually quite good at 81%.
+
+##### Decision Tree
+
+Now onto a single decision tree.
+
+```{r, eval =  FALSE}
+tree <- rpart(federal.tax ~ AGE + SEX + race + deg.field,
+              data  = ipums.train)
+
+save(tree,
+     file = 'tree.R')
+```
+
+```{r}
+load("tree.R")
+tree.prediction <- predict(tree,
+                           ipums.test,
+                           type  = "class")
+
+performance(tree.prediction, ipums.test$federal.tax)
+```
+
+Both accuracy and Kappa have improved to 34% and .063 respectively. This is a good sign. Something interesting has occured- an almost reversal of linear regression where we have a bunch of predicted observations in the 10% bracket, but none in the 24% bracket. Preceision is even better on the 22% bracket with this model. Although these are still not great results, it is a step in the right direction- hopefully a random forest will help even further.
+
+##### randomForest
+
+```{r, eval=FALSE}
+ipums.train$deg.field <- as.factor(ipums.train$deg.field)
+ipums.train$race <- as.factor(ipums.train$race)
+ipums.train$federal.tax <- as.factor(ipums.train$federal.tax)
+
+rf.50 <- randomForest(federal.tax ~ race +  deg.field + AGE + SEX,
+                   data = ipums.train,
+                   ntree =  50)
+rf.100 <- randomForest(federal.tax ~ race + deg.field + AGE + SEX,
+                   data = ipums.train,
+                   ntree =  100)
+rf.150 <- randomForest(federal.tax ~ race +  deg.field + AGE + SEX,
+                   data = ipums.train,
+                   ntree =  150)
+rf.200 <- randomForest(federal.tax ~ race +  deg.field + AGE + SEX,
+                   data = ipums.train,
+                   ntree =  200)
+rf.300 <- randomForest(federal.tax ~ race +  deg.field + AGE + SEX,
+                   data = ipums.train,
+                   ntree =  300)
+
+save(rf.50,
+     file = "rf.50.R")
+save(rf.100,
+     file = "rf.100.R")
+save(rf.150,
+     file = "rf.150.R")
+save(rf.200,
+     file = "rf.200.R")
+save(rf.300,
+     file = "rf.300.R")
+```
+
+```{r, results = "hide"}
+load('rf.50.R')
+load('rf.100.R')
+load('rf.150.R')
+load('rf.200.R')
+load('rf.300.R')
+
+ipums.test$deg.field <- as.factor(ipums.test$deg.field)
+ipums.test$race <- as.factor(ipums.test$race)
+ipums.test$federal.tax <- as.factor(ipums.test$federal.tax)
+
+rf.prediction.50 <- predict(rf.50,
+                          ipums.test)
+rf.prediction.100 <- predict(rf.100,
+                          ipums.test)
+rf.prediction.150 <- predict(rf.150,
+                          ipums.test)
+rf.prediction.200 <- predict(rf.200,
+                          ipums.test)
+rf.prediction.300 <- predict(rf.300,
+                          ipums.test)
+
+perf.50 <- performance(rf.prediction.50, ipums.test$federal.tax)
+perf.100 <- performance(rf.prediction.100, ipums.test$federal.tax)
+perf.150 <- performance(rf.prediction.150, ipums.test$federal.tax)
+perf.200 <- performance(rf.prediction.200, ipums.test$federal.tax)
+perf.300 <- performance(rf.prediction.300, ipums.test$federal.tax)
+
+g1 <- rbind(perf.50[[2]] %>% mutate(ntree = 50),
+            perf.100[[2]] %>% mutate(ntree = 100),
+            perf.150[[2]] %>% mutate(ntree = 150),
+            perf.200[[2]] %>% mutate(ntree = 200),
+            perf.300[[2]] %>% mutate(ntree = 300))
+```
+
+We will plot the Accuracy and Kappa of each of our forests with differing numbers of trees.
+
+```{r}
+g1 %>%
+  ggplot(aes(x = Accuracy,
+             y = Cohen.Kappa)) +
+  geom_point(aes(color = factor(ntree))) +
+  theme_classic()
+```
+
+
+These all seem to be relatively the same in terms of performance. So we'll just look at ntree=150 to try out a variety of mtry values, and see their impact.
+
+```{r}
+performance(rf.prediction.150, ipums.test$federal.tax)
+```
+
+
+Another improvement! Accuracy up to almost 36% and Kappa has passed 0.1 for the first time. Granted, this is still not particularly far from 0, but we are at least improving in the direction away from randomness.
+
+```{r,eval = FALSE}
+rf.2 <- randomForest(federal.tax ~ race +  deg.field + AGE + SEX,
+                   data = ipums.train,
+                   ntree =  150,
+                   mtry = 2)
+rf.3 <- randomForest(federal.tax ~ race +  deg.field + AGE + SEX,
+                   data = ipums.train,
+                   ntree =  150,
+                   mtry = 3)
+rf.4 <- randomForest(federal.tax ~ race + deg.field + AGE + SEX,
+                   data = ipums.train,
+                   ntree =  150,
+                   mtry = 4)
+
+save(rf.2,
+     file = "rf.2.R")
+save(rf.3,
+     file = "rf.3.R")
+save(rf.4,
+     file = "rf.4.R")
+```
+
+```{r, results = "hide"}
+load('rf.2.R')
+load('rf.3.R')
+load('rf.4.R')
+
+ipums.test$deg.field <- as.factor(ipums.test$deg.field)
+ipums.test$race <- as.factor(ipums.test$race)
+ipums.test$federal.tax <- as.factor(ipums.test$federal.tax)
+
+rf.prediction.2 <- predict(rf.2,
+                          ipums.test)
+rf.prediction.3 <- predict(rf.3,
+                          ipums.test)
+rf.prediction.4 <- predict(rf.4,
+                          ipums.test)
+
+perf.2 <- performance(rf.prediction.2, ipums.test$federal.tax)
+perf.3 <- performance(rf.prediction.3, ipums.test$federal.tax)
+perf.4 <- performance(rf.prediction.4, ipums.test$federal.tax)
+
+g2 <- rbind(perf.2[[2]] %>% mutate(mtry = 2),
+            perf.3[[2]] %>% mutate(mtry = 3),
+            perf.4[[2]] %>% mutate(mtry = 4))
+```
+
+Once again, plotting Accuracy vs Kappa.
+
+```{r}
+g2 %>%
+  ggplot(aes(x = Accuracy,
+             y = Cohen.Kappa)) +
+  geom_point(aes(color = factor(mtry))) +
+  theme_classic()
+```
+
+mtry=2 appears to be our best bet here. However, something interesting is going on if we look at the confusion matrices.
+
+```{r}
+perf.2[[1]]
+perf.3[[1]]
+perf.4[[1]]
+```
+
+Although a lower mtry may be more accurate, we see that we are actually having increased success classifying those in higher tax brackets. This is a marked improvement from any previous model we've constructed. If our goal is not just accuracy, but rather improved performance across classes, then considering a higher number of variables seems to be important.
+
+
+##### kNN
+
+Let's return to our roots and build a KNN model in the hopes that perhaps proximity will yield some decent results.
+
+(Note: I write the predictions to a .csv to then read in later to once again save time.)
+```{r, eval=FALSE}
+knn.train <- scale(ipums.train_dummy)
+knn.test <- scale(ipums.test_dummy)
+
+
+knn.prediction.1  <-  knn(knn.train,
+                          knn.test,
+                          cl = ipums.train$federal.tax,
+                          k = 1)
+write.csv(knn.prediction.1,
+          "knn.prediction.1.csv")
+knn.prediction.2  <-  knn(knn.train,
+                          knn.test,
+                          cl = ipums.train$federal.tax,
+                          k = 2)
+write.csv(knn.prediction.2,
+          "knn.prediction.2.csv")
+knn.prediction.3  <-  knn(knn.train,
+                          knn.test,
+                          cl = ipums.train$federal.tax,
+                          k = 3)
+write.csv(knn.prediction.3,
+          "knn.prediction.3.csv")
+```
+
+```{r}
+knn.prediction.1 <- as.vector(fread("knn.prediction.1.csv")[-1,2])[[1]]
+knn.prediction.2 <- as.vector(fread("knn.prediction.2.csv")[-1,2])[[1]]
+knn.prediction.3 <- as.vector(fread("knn.prediction.3.csv")[-1,2])[[1]]
+
+performance(knn.prediction.1, ipums.test$federal.tax)
+performance(knn.prediction.2, ipums.test$federal.tax)
+performance(knn.prediction.3, ipums.test$federal.tax)
+```
+
+As we can see, for k = 1 through k = 3, they all have relatively the same performance with about 24% accuracy and a Kappa a little over 0.1. They also all have similar precision/recall. Much like the randomForest algorithm we have some predicted upper tax brackets here, but ultimately slightly lower accuracy and Kappa.
+
+##### GBM
+
+Finally, we will construct a gradient boosted algorithm in order to hopefully deal with our underrepresented classes.
+
+```{r, eval = FALSE}
+gbm.model <- gbm(federal.tax ~ race + deg.field + AGE + SEX,
+                  data = ipums.train,
+                 n.trees = 1000,
+                 distribution = "multinomial")
+
+save(gbm.model,
+     file = "gbm.model.R")
+```
+
+
+```{r}
+load("gbm.model.R")
+
+gbm.prediction <- gather(data.frame(predict.gbm(gbm.model,
+        ipums.test,
+        n.trees = 1000),
+        obs = 1:nrow(ipums.test)),
+        key = "federal.tax",
+        value = "prob",
+        -obs)
+
+gbm.prediction$federal.tax <- as.factor(gbm.prediction$federal.tax)
+
+levels(gbm.prediction$federal.tax) <- c("10%", "12%", "22%", "24%", "32%", "35%", "37%")
+
+gbm.prediction <- gbm.prediction %>%
+  group_by(obs) %>%
+  filter(prob == max(prob))
+
+performance(gbm.prediction$federal.tax, ipums.test$federal.tax)
+```
+
+Unfortunately, we have returned back to essentially the same accuracy as linear regression and a terrible Kappa, once again ignoring the upper three tax brackets. It seems that GBM is not the answer.
+
+### Conclusion
+
+After all of these tests, I conclude that the randomForest is the best algorithm for this particular problem. I believe this is due to the fact that we have so many different factors and an uneven class distribution. Therefore, the randomForest algorithm with its bootstrapping and randomized variable choice allows for better predictions.
+
+At the end of the day, the best performing algorithm managed to predict the correct class with about 36% accuracy and a Kappa of 0.11. These are certainly not ideal metrics, but there is still something to be gleaned from this exercise. Namely, our issues seem to stem from an uneven distribution of classes and computational limitations. If we had the computing capacity to consider industry, then perhaps our classifications would be more accurate. However, it's not only issues that we glean. The succcess of kNN demonstrates a level of association between tax bracket and our predictor variables, but that success relies on specificity. The nuances of the problem require nuanced algorithms. Ultimately, based on our findings here, I feel that a random forest would most likely have the best success with a probelm similar to this. Perhaps, given more variables and greater computing power, we could achieve even greater results.
+
+
+
+
